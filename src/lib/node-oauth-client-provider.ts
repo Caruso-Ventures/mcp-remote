@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 import { mkdir, rm } from 'node:fs/promises'
+import { statSync } from 'node:fs'
 import { getConfigFilePath } from './mcp-auth-config'
 
 // --- cross-process refresh coordination ---------------------------------
@@ -30,6 +31,7 @@ import { getConfigFilePath } from './mcp-auth-config'
 const REFRESH_SKEW_MS = 30_000 // treat tokens expiring within 30s as stale
 const REFRESH_LOCK_TIMEOUT_MS = 15_000 // max wait to acquire the lock
 const REFRESH_LOCK_STALE_MS = 60_000 // break locks older than this (crashed holder)
+const REFRESH_LOCK_FAILSAFE_MS = 20_000 // release own lock if refresh never saves
 
 type TokensMeta = { savedAt: number }
 
@@ -47,7 +49,6 @@ async function acquireRefreshLock(serverUrlHash: string): Promise<boolean> {
     } catch {
       // Lock held — break it if stale (holder crashed before saveTokens).
       try {
-        const { statSync } = await import('node:fs')
         const age = Date.now() - statSync(lockDir).mtimeMs
         if (age > REFRESH_LOCK_STALE_MS) {
           await rm(lockDir, { recursive: true, force: true })
@@ -72,7 +73,8 @@ async function releaseRefreshLock(serverUrlHash: string): Promise<void> {
  */
 export class NodeOAuthClientProvider implements OAuthClientProvider {
   private serverUrlHash: string
-  private holdingRefreshLock = false
+  private refreshLockGeneration: number | null = null
+  private lockGenerationCounter = 0
   private callbackPath: string
   private clientName: string
   private clientUri: string
@@ -249,7 +251,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     // Refresh coordination: if the access token is stale and refreshable,
     // serialize with sibling processes before letting the SDK refresh.
-    if (tokens?.refresh_token && !(await this.tokensAreFresh(tokens))) {
+    // Re-entrancy: if THIS process already holds the lock (SDK called
+    // tokens() again mid-refresh-cycle), don't contend with ourselves.
+    if (tokens?.refresh_token && this.refreshLockGeneration === null && !(await this.tokensAreFresh(tokens))) {
       debugLog('Access token stale — acquiring refresh lock')
       if (await acquireRefreshLock(this.serverUrlHash)) {
         // Re-read: a sibling may have refreshed while we waited on the lock.
@@ -260,15 +264,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
           return reread
         }
         // We hold the lock and tokens are genuinely stale: this process will
-        // perform the refresh. saveTokens() releases the lock; a failsafe
-        // timer releases it if the refresh dies before saving.
-        this.holdingRefreshLock = true
+        // perform the refresh. saveTokens() releases the lock. A failsafe
+        // releases it if the refresh dies before saving — generation-tagged
+        // so an old timer can never release a NEWER cycle's lock, and short
+        // (well under token lifetime) so a no-refresh path doesn't hold the
+        // fleet's lock long.
+        const generation = ++this.lockGenerationCounter
+        this.refreshLockGeneration = generation
         setTimeout(() => {
-          if (this.holdingRefreshLock) {
-            this.holdingRefreshLock = false
+          if (this.refreshLockGeneration === generation) {
+            debugLog('Refresh lock failsafe fired — releasing (no saveTokens observed)')
+            this.refreshLockGeneration = null
             releaseRefreshLock(this.serverUrlHash).catch(() => {})
           }
-        }, REFRESH_LOCK_STALE_MS).unref?.()
+        }, REFRESH_LOCK_FAILSAFE_MS).unref?.()
         tokens = reread ?? tokens
       } else {
         debugLog('Refresh lock acquisition timed out — proceeding without coordination')
@@ -330,8 +339,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     await writeJsonFile(this.serverUrlHash, 'tokens-meta.json', { savedAt: Date.now() } satisfies TokensMeta)
 
     // If this process held the refresh lock, the refresh is complete.
-    if (this.holdingRefreshLock) {
-      this.holdingRefreshLock = false
+    if (this.refreshLockGeneration !== null) {
+      this.refreshLockGeneration = null
       await releaseRefreshLock(this.serverUrlHash)
       debugLog('Refresh complete — lock released')
     }

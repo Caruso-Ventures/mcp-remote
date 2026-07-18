@@ -135,9 +135,26 @@ const SURFACE_POLL_ID_PREFIX = 'cvbridge-poll-'
 // Stable fingerprint of an advertised tool surface. Any change to a tool's
 // name, description, or schema changes the hash — which is exactly the set of
 // changes a client needs a list_changed for.
+// Deep key-sorted serialization: object key order must not affect the hash
+// (a stateless server may emit schema keys in varying order between requests).
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']'
+  if (v && typeof v === 'object') {
+    return (
+      '{' +
+      Object.keys(v as Record<string, unknown>)
+        .sort()
+        .map((k) => JSON.stringify(k) + ':' + canonicalJson((v as Record<string, unknown>)[k]))
+        .join(',') +
+      '}'
+    )
+  }
+  return JSON.stringify(v)
+}
+
 export function surfaceHashOfTools(tools: Array<{ name: string; description?: string; inputSchema?: unknown }>): string {
   const canon = tools
-    .map((t) => [t.name, t.description ?? '', JSON.stringify(t.inputSchema ?? null)])
+    .map((t) => [t.name, t.description ?? '', canonicalJson(t.inputSchema ?? null)])
     .sort((a, b) => (a[0] < b[0] ? -1 : 1))
   return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex')
 }
@@ -190,11 +207,7 @@ export function mcpProxy({
   const startSurfaceWatch = () => {
     if (!watchToolsMs || pollTimer) return
     log(`[surface-watch] polling upstream tools/list every ${watchToolsMs}ms`)
-    pollTimer = setInterval(() => {
-      transportToServer
-        .send({ jsonrpc: '2.0' as const, id: `${SURFACE_POLL_ID_PREFIX}${pollCounter++}`, method: 'tools/list', params: {} })
-        .catch((err: Error) => debugLog('[surface-watch] poll send failed', { message: err.message }))
-    }, watchToolsMs)
+    pollTimer = setInterval(pollNow, watchToolsMs)
   }
 
   const stopSurfaceWatch = () => {
@@ -277,6 +290,12 @@ export function mcpProxy({
     }
 
     if (message.method === 'tools/call' && message.id !== undefined && message.params?.name) {
+      // Bound the map: never-answered calls (server dropped mid-redeploy,
+      // cancellations) would otherwise leak for the session's lifetime.
+      if (pendingToolCalls.size >= 500) {
+        const oldest = pendingToolCalls.keys().next().value
+        if (oldest !== undefined) pendingToolCalls.delete(oldest)
+      }
       pendingToolCalls.set(message.id, message.params.name)
     }
 
@@ -359,6 +378,7 @@ export function mcpProxy({
 
   transportToClient.onclose = () => {
     stopSurfaceWatch()
+    pendingToolCalls.clear()
     if (transportToServerClosed) {
       return
     }
@@ -370,6 +390,7 @@ export function mcpProxy({
 
   transportToServer.onclose = () => {
     stopSurfaceWatch()
+    pendingToolCalls.clear()
     if (transportToClientClosed) {
       return
     }
