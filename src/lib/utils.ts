@@ -161,6 +161,18 @@ export function mcpProxy({
   let pollCounter = 0
   let pollTimer: ReturnType<typeof setInterval> | null = null
 
+  // tools/call requests in flight, id -> tool name. Lets upstream call
+  // failures be reshaped into instructive isError results (which the model
+  // reads and can relay/retry) instead of opaque protocol errors.
+  const pendingToolCalls = new Map<string | number, string>()
+
+  const pollNow = () => {
+    if (!watchToolsMs) return
+    transportToServer
+      .send({ jsonrpc: '2.0' as const, id: `${SURFACE_POLL_ID_PREFIX}${pollCounter++}`, method: 'tools/list', params: {} })
+      .catch((err: Error) => debugLog('[surface-watch] immediate poll failed', { message: err.message }))
+  }
+
   // Observe a tools/list result (organic or poll), post ignoredTools filter so
   // the hash tracks what the client actually sees. Emits list_changed on diff.
   const observeSurface = (tools: Array<{ name: string }>) => {
@@ -264,6 +276,10 @@ export function mcpProxy({
       startSurfaceWatch()
     }
 
+    if (message.method === 'tools/call' && message.id !== undefined && message.params?.name) {
+      pendingToolCalls.set(message.id, message.params.name)
+    }
+
     transportToServer.send(message).catch(onServerError)
   }
 
@@ -277,7 +293,58 @@ export function mcpProxy({
     }
 
     // TODO: fix types
-    const message = messageTransformer.interceptResponse(_message as any)
+    let message = messageTransformer.interceptResponse(_message as any)
+
+    // Reshape upstream tools/call failures into instructive isError results.
+    // The classic case is a stale session calling a tool the server dropped
+    // in a redeploy: trigger an immediate surface check (so the refreshed
+    // list is one list_changed away) and tell the model what happened.
+    if (message.id !== undefined && pendingToolCalls.has(message.id)) {
+      const toolName = pendingToolCalls.get(message.id)
+      pendingToolCalls.delete(message.id)
+      // Upstream may signal failure either way: execution error (isError
+      // result — e.g. mcp-handler's unknown-tool) or JSON-RPC error. Both
+      // get the surface re-check; the isError text gets guidance appended.
+      if (!message.error && message.result?.isError && Array.isArray(message.result.content)) {
+        log(`[error-shape] upstream isError for tools/call ${toolName} — appending guidance + re-checking surface`)
+        pollNow()
+        message = {
+          ...message,
+          result: {
+            ...message.result,
+            content: [
+              ...message.result.content,
+              {
+                type: 'text' as const,
+                text:
+                  `Note: the server's tool surface may have just changed (redeploy); the tool list has been re-checked. ` +
+                  `If "${toolName}" was replaced or renamed, the refreshed tool list will show the replacement — re-check available tools and retry.`,
+              },
+            ],
+          },
+        }
+      } else if (message.error) {
+        log(`[error-shape] upstream error for tools/call ${toolName}: ${message.error.message}`)
+        pollNow()
+        message = {
+          jsonrpc: '2.0' as const,
+          id: message.id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `Call to "${toolName}" failed upstream: ${message.error.message}. ` +
+                  `The server's tool surface may have just changed (redeploy); the tool list has been re-checked. ` +
+                  `If "${toolName}" was replaced or renamed, the refreshed tool list will show the replacement — re-check the available tools and retry.`,
+              },
+            ],
+          },
+        }
+      }
+    }
+
     log('[Remote→Local]', message.method || message.id)
 
     debugLog('Remote → Local message', {
