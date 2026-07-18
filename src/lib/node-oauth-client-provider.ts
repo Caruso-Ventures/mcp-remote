@@ -14,6 +14,57 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+import { mkdir, rm } from 'node:fs/promises'
+import { getConfigFilePath } from './mcp-auth-config'
+
+// --- cross-process refresh coordination ---------------------------------
+// tokens.json stores a RELATIVE expires_in, so a sidecar records WHEN the
+// tokens were saved; together they give absolute expiry. When the access
+// token is stale, concurrent proxies would otherwise all burn the same
+// (rotating) refresh_token — first wins, the rest get invalid_grant and drop
+// the user into a browser re-auth. A mkdir-based lock serializes refresh:
+// the lock is taken in tokens() when stale, held through the SDK's refresh,
+// and released in saveTokens(). Waiters re-read disk after acquiring — if a
+// sibling already refreshed, they return the fresh tokens and the SDK never
+// refreshes at all.
+const REFRESH_SKEW_MS = 30_000 // treat tokens expiring within 30s as stale
+const REFRESH_LOCK_TIMEOUT_MS = 15_000 // max wait to acquire the lock
+const REFRESH_LOCK_STALE_MS = 60_000 // break locks older than this (crashed holder)
+
+type TokensMeta = { savedAt: number }
+
+function refreshLockPath(serverUrlHash: string): string {
+  return getConfigFilePath(serverUrlHash, 'refresh.lock')
+}
+
+async function acquireRefreshLock(serverUrlHash: string): Promise<boolean> {
+  const lockDir = refreshLockPath(serverUrlHash)
+  const deadline = Date.now() + REFRESH_LOCK_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    try {
+      await mkdir(lockDir)
+      return true
+    } catch {
+      // Lock held — break it if stale (holder crashed before saveTokens).
+      try {
+        const { statSync } = await import('node:fs')
+        const age = Date.now() - statSync(lockDir).mtimeMs
+        if (age > REFRESH_LOCK_STALE_MS) {
+          await rm(lockDir, { recursive: true, force: true })
+          continue
+        }
+      } catch {
+        continue // lock vanished between mkdir and stat — retry immediately
+      }
+      await new Promise((r) => setTimeout(r, 250))
+    }
+  }
+  return false
+}
+
+async function releaseRefreshLock(serverUrlHash: string): Promise<void> {
+  await rm(refreshLockPath(serverUrlHash), { recursive: true, force: true }).catch(() => {})
+}
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -21,6 +72,7 @@ import type { ProtectedResourceMetadata } from './protected-resource-metadata'
  */
 export class NodeOAuthClientProvider implements OAuthClientProvider {
   private serverUrlHash: string
+  private holdingRefreshLock = false
   private callbackPath: string
   private clientName: string
   private clientUri: string
@@ -193,7 +245,35 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    let tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+
+    // Refresh coordination: if the access token is stale and refreshable,
+    // serialize with sibling processes before letting the SDK refresh.
+    if (tokens?.refresh_token && !(await this.tokensAreFresh(tokens))) {
+      debugLog('Access token stale — acquiring refresh lock')
+      if (await acquireRefreshLock(this.serverUrlHash)) {
+        // Re-read: a sibling may have refreshed while we waited on the lock.
+        const reread = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+        if (reread && (await this.tokensAreFresh(reread))) {
+          debugLog('Sibling process refreshed while we waited — using fresh tokens from disk')
+          await releaseRefreshLock(this.serverUrlHash)
+          return reread
+        }
+        // We hold the lock and tokens are genuinely stale: this process will
+        // perform the refresh. saveTokens() releases the lock; a failsafe
+        // timer releases it if the refresh dies before saving.
+        this.holdingRefreshLock = true
+        setTimeout(() => {
+          if (this.holdingRefreshLock) {
+            this.holdingRefreshLock = false
+            releaseRefreshLock(this.serverUrlHash).catch(() => {})
+          }
+        }, REFRESH_LOCK_STALE_MS).unref?.()
+        tokens = reread ?? tokens
+      } else {
+        debugLog('Refresh lock acquisition timed out — proceeding without coordination')
+      }
+    }
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -246,6 +326,27 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     })
 
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    // Absolute-expiry sidecar (tokens.json only has a relative expires_in).
+    await writeJsonFile(this.serverUrlHash, 'tokens-meta.json', { savedAt: Date.now() } satisfies TokensMeta)
+
+    // If this process held the refresh lock, the refresh is complete.
+    if (this.holdingRefreshLock) {
+      this.holdingRefreshLock = false
+      await releaseRefreshLock(this.serverUrlHash)
+      debugLog('Refresh complete — lock released')
+    }
+  }
+
+  // True when the stored access token is still valid (with skew), judged by
+  // the sidecar's absolute savedAt + expires_in. Missing sidecar (pre-upgrade
+  // cache) counts as stale, which just costs one coordinated refresh.
+  private async tokensAreFresh(tokens: OAuthTokens): Promise<boolean> {
+    if (typeof tokens.expires_in !== 'number') return false
+    const meta = await readJsonFile<TokensMeta>(this.serverUrlHash, 'tokens-meta.json', {
+      parseAsync: async (v: unknown) => v as TokensMeta,
+    })
+    if (!meta?.savedAt) return false
+    return meta.savedAt + tokens.expires_in * 1000 - REFRESH_SKEW_MS > Date.now()
   }
 
   /**
