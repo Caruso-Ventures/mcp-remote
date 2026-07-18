@@ -40,6 +40,7 @@ async function runProxy(
   ignoredTools: string[],
   authTimeoutMs: number,
   serverUrlHash: string,
+  watchToolsMs?: number,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -114,6 +115,7 @@ async function runProxy(
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
+      watchToolsMs,
     })
 
     // Start the local STDIO server
@@ -180,6 +182,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       ignoredTools,
       authTimeoutMs,
       serverUrlHash,
+      watchToolsMs,
     }) => {
       return runProxy(
         serverUrl,
@@ -193,6 +196,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
+        watchToolsMs,
       )
     },
   )

@@ -128,17 +128,69 @@ export function createMessageTransformer({
  * Creates a bidirectional proxy between two transports
  * @param params The transport connections to proxy between
  */
+// Reserved JSON-RPC id prefix for surface-watch polls. Responses carrying this
+// prefix are consumed by the proxy and never forwarded to the client.
+const SURFACE_POLL_ID_PREFIX = 'cvbridge-poll-'
+
+// Stable fingerprint of an advertised tool surface. Any change to a tool's
+// name, description, or schema changes the hash — which is exactly the set of
+// changes a client needs a list_changed for.
+export function surfaceHashOfTools(tools: Array<{ name: string; description?: string; inputSchema?: unknown }>): string {
+  const canon = tools
+    .map((t) => [t.name, t.description ?? '', JSON.stringify(t.inputSchema ?? null)])
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+  return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex')
+}
+
 export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  watchToolsMs,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
+  watchToolsMs?: number
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
+
+  // --- surface-watch state (only active when watchToolsMs is set) ---
+  let lastSurfaceHash: string | null = null
+  let pollCounter = 0
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+
+  // Observe a tools/list result (organic or poll), post ignoredTools filter so
+  // the hash tracks what the client actually sees. Emits list_changed on diff.
+  const observeSurface = (tools: Array<{ name: string }>) => {
+    const visible = tools.filter((tool) => shouldIncludeTool(ignoredTools, tool.name))
+    const hash = surfaceHashOfTools(visible as any)
+    if (lastSurfaceHash !== null && hash !== lastSurfaceHash) {
+      log('[surface-watch] tool surface changed, notifying client')
+      transportToClient
+        .send({ jsonrpc: '2.0' as const, method: 'notifications/tools/list_changed' })
+        .catch(onClientError)
+    }
+    lastSurfaceHash = hash
+  }
+
+  const startSurfaceWatch = () => {
+    if (!watchToolsMs || pollTimer) return
+    log(`[surface-watch] polling upstream tools/list every ${watchToolsMs}ms`)
+    pollTimer = setInterval(() => {
+      transportToServer
+        .send({ jsonrpc: '2.0' as const, id: `${SURFACE_POLL_ID_PREFIX}${pollCounter++}`, method: 'tools/list', params: {} })
+        .catch((err: Error) => debugLog('[surface-watch] poll send failed', { message: err.message }))
+    }, watchToolsMs)
+  }
+
+  const stopSurfaceWatch = () => {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -164,13 +216,18 @@ export function mcpProxy({
     },
     transformResponseFunction: (req: Message, res: Message) => {
       if (req.method === 'tools/list') {
-        return {
+        const filtered = {
           ...res,
           result: {
             ...res.result,
             tools: res.result.tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
           },
         }
+        // Organic list responses seed/refresh the surface-watch baseline. The
+        // hash is computed inside observeSurface from the pre-filter list, so
+        // pass the raw tools; it applies the same filter itself.
+        if (watchToolsMs) observeSurface(res.result.tools)
+        return filtered
       }
       return res
     },
@@ -201,10 +258,24 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
+    // Client is initialized — spec-safe point to begin sending our own
+    // tools/list polls upstream.
+    if (message.method === 'notifications/initialized') {
+      startSurfaceWatch()
+    }
+
     transportToServer.send(message).catch(onServerError)
   }
 
   transportToServer.onmessage = (_message) => {
+    // Surface-watch poll responses are proxy-internal: observe and swallow.
+    const raw = _message as any
+    if (typeof raw.id === 'string' && raw.id.startsWith(SURFACE_POLL_ID_PREFIX)) {
+      if (raw.result?.tools) observeSurface(raw.result.tools)
+      else debugLog('[surface-watch] poll returned no tools', { error: raw.error })
+      return
+    }
+
     // TODO: fix types
     const message = messageTransformer.interceptResponse(_message as any)
     log('[Remote→Local]', message.method || message.id)
@@ -220,6 +291,7 @@ export function mcpProxy({
   }
 
   transportToClient.onclose = () => {
+    stopSurfaceWatch()
     if (transportToServerClosed) {
       return
     }
@@ -230,6 +302,7 @@ export function mcpProxy({
   }
 
   transportToServer.onclose = () => {
+    stopSurfaceWatch()
     if (transportToClientClosed) {
       return
     }
@@ -929,6 +1002,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     })
   }
 
+  // Parse surface-watch flag: --watch-tools [intervalMs]. Default 30s when the
+  // flag is present without a value; feature off entirely when absent.
+  let watchToolsMs: number | undefined = undefined
+  const watchToolsIndex = args.indexOf('--watch-tools')
+  if (watchToolsIndex !== -1) {
+    const next = args[watchToolsIndex + 1]
+    const parsed = next && /^\d+$/.test(next) ? parseInt(next, 10) : NaN
+    watchToolsMs = Number.isFinite(parsed) && parsed >= 1000 ? parsed : 30_000
+    log(`Surface watch enabled: polling tools/list every ${watchToolsMs}ms`)
+  }
+
   return {
     serverUrl,
     callbackPort,
@@ -942,6 +1026,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     ignoredTools,
     authTimeoutMs,
     serverUrlHash,
+    watchToolsMs,
   }
 }
 
