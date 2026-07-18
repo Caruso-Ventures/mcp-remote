@@ -470,6 +470,10 @@ export async function connectToRemoteServer(
   recursionReasons: Set<string> = new Set(),
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
+
+  // Bridge fleet governance: every upstream request self-reports the proxy
+  // version so the server can log drift and instruct outdated bridges.
+  headers = { 'X-Bridge-Version': MCP_REMOTE_VERSION, ...headers }
   const url = new URL(serverUrl)
 
   // Create transport with eventSourceInit to pass Authorization header if present
