@@ -29,7 +29,8 @@
     "check": "prettier --check . && tsc",
     "lint-fix": "prettier --check . --write",
     "test:unit": "vitest run",
-    "test:unit:watch": "vitest"
+    "test:unit:watch": "vitest",
+    "build:bridge": "esbuild src/proxy.ts --bundle --platform=node --format=esm --outfile=dist/cv-bridge.mjs --banner:js='import { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);'"
   },
   "dependencies": {
     "express": "^4.21.2",
