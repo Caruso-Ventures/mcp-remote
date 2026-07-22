@@ -3,6 +3,8 @@ import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
+import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import { refreshAuthorization, selectResourceURL } from '@modelcontextprotocol/sdk/client/auth.js'
 
 vi.mock('./mcp-auth-config')
 vi.mock('./authorization-server-metadata', () => ({
@@ -16,6 +18,21 @@ vi.mock('./utils', () => ({
   MCP_REMOTE_VERSION: '1.0.0',
 }))
 vi.mock('open', () => ({ default: vi.fn() }))
+vi.mock('@modelcontextprotocol/sdk/client/auth.js', async (importOriginal) => {
+  const actual = await importOriginal<any>()
+  return {
+    ...actual,
+    refreshAuthorization: vi.fn(),
+    selectResourceURL: vi.fn().mockResolvedValue(undefined),
+  }
+})
+vi.mock('node:fs/promises', () => ({
+  mkdir: vi.fn().mockResolvedValue(undefined),
+  rm: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock('node:fs', () => ({
+  statSync: vi.fn().mockReturnValue({ mtimeMs: Date.now() }),
+}))
 
 describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   let provider: NodeOAuthClientProvider
@@ -300,6 +317,151 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       const clientMetadata = provider.clientMetadata
       // Empty scope should fallback to default
       expect(clientMetadata.scope).toBe('openid email profile')
+    })
+  })
+
+  describe('provider-side single-flight refresh', () => {
+    const staleTokens = {
+      access_token: 'old',
+      refresh_token: 'rt1',
+      expires_in: 300,
+      token_type: 'Bearer',
+    }
+    const freshFromRefresh = {
+      access_token: 'new',
+      refresh_token: 'rt2',
+      expires_in: 300,
+      token_type: 'Bearer',
+    }
+
+    beforeEach(async () => {
+      vi.mocked(refreshAuthorization).mockReset()
+      vi.mocked(selectResourceURL)
+        .mockReset()
+        .mockResolvedValue(undefined as any)
+      const { mkdir, rm } = await import('node:fs/promises')
+      vi.mocked(mkdir)
+        .mockReset()
+        .mockResolvedValue(undefined as any)
+      vi.mocked(rm)
+        .mockReset()
+        .mockResolvedValue(undefined as any)
+    })
+
+    it('single-flight: N concurrent tokens() calls trigger exactly ONE refresh POST', async () => {
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') return staleTokens
+        if (filename === 'tokens-meta.json') return { savedAt: 0 }
+        if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
+        return undefined
+      })
+      vi.mocked(refreshAuthorization).mockResolvedValue(freshFromRefresh as any)
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+      })
+
+      const [t1, t2, t3] = await Promise.all([provider.tokens(), provider.tokens(), provider.tokens()])
+
+      expect(refreshAuthorization).toHaveBeenCalledTimes(1)
+      expect(t1).toMatchObject(freshFromRefresh)
+      expect(t2).toMatchObject(freshFromRefresh)
+      expect(t3).toMatchObject(freshFromRefresh)
+      expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining(freshFromRefresh))
+    })
+
+    it('lock-timeout path returns the freshest disk tokens without calling refreshAuthorization', async () => {
+      vi.useFakeTimers()
+      try {
+        const { mkdir } = await import('node:fs/promises')
+        vi.mocked(mkdir).mockRejectedValue(new Error('locked'))
+
+        const freshSibling = { access_token: 'sibling', refresh_token: 'rt2', expires_in: 300, token_type: 'Bearer' }
+        // First 'tokens.json' read (the initial staleness check) is stale;
+        // the re-read after the lock-acquire timeout finds a fresh sibling.
+        let tokensCall = 0
+        mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+          if (filename === 'tokens.json') {
+            tokensCall += 1
+            return tokensCall === 1 ? staleTokens : freshSibling
+          }
+          // Always stale for the initial tokensAreFresh() check — the
+          // timeout branch never re-checks freshness, it just re-reads.
+          if (filename === 'tokens-meta.json') return { savedAt: 0 }
+          return undefined
+        })
+
+        provider = new NodeOAuthClientProvider({
+          ...defaultOptions,
+          authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+        })
+
+        const resultPromise = provider.tokens()
+        // Drive the acquireRefreshLock retry loop (250ms sleeps) past its
+        // 15s deadline without waiting on real wall-clock time.
+        await vi.advanceTimersByTimeAsync(16_000)
+        const result = await resultPromise
+
+        expect(result).toMatchObject(freshSibling)
+        expect(refreshAuthorization).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it("invalid_grant returns current (stale) tokens without saving — browser re-auth is the SDK's job", async () => {
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') return staleTokens
+        if (filename === 'tokens-meta.json') return { savedAt: 0 }
+        if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
+        return undefined
+      })
+      vi.mocked(refreshAuthorization).mockRejectedValue(new InvalidGrantError('bad'))
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+      })
+
+      const result = await provider.tokens()
+
+      expect(result).toMatchObject(staleTokens)
+      expect(mockWriteJsonFile).not.toHaveBeenCalledWith('test-hash', 'tokens.json', expect.anything())
+    })
+
+    it('transient refresh error is re-thrown, not swallowed into a browser bounce', async () => {
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') return staleTokens
+        if (filename === 'tokens-meta.json') return { savedAt: 0 }
+        if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
+        return undefined
+      })
+      vi.mocked(refreshAuthorization).mockRejectedValue(new Error('network'))
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+      })
+
+      await expect(provider.tokens()).rejects.toThrow('network')
+    })
+
+    it('fresh token short-circuits: no refresh, no lock', async () => {
+      const { mkdir } = await import('node:fs/promises')
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') return staleTokens
+        if (filename === 'tokens-meta.json') return { savedAt: Date.now() }
+        return undefined
+      })
+
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const result = await provider.tokens()
+
+      expect(result).toMatchObject(staleTokens)
+      expect(refreshAuthorization).not.toHaveBeenCalled()
+      expect(mkdir).not.toHaveBeenCalled()
     })
   })
 })

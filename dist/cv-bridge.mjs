@@ -66950,7 +66950,6 @@ import { statSync } from "node:fs";
 var REFRESH_SKEW_MS = 3e4;
 var REFRESH_LOCK_TIMEOUT_MS = 15e3;
 var REFRESH_LOCK_STALE_MS = 6e4;
-var REFRESH_LOCK_FAILSAFE_MS = 2e4;
 function refreshLockPath(serverUrlHash) {
   return getConfigFilePath(serverUrlHash, "refresh.lock");
 }
@@ -67004,8 +67003,7 @@ var NodeOAuthClientProvider = class {
   }
   options;
   serverUrlHash;
-  refreshLockGeneration = null;
-  lockGenerationCounter = 0;
+  inFlightRefresh = null;
   callbackPath;
   clientName;
   clientUri;
@@ -67133,29 +67131,9 @@ var NodeOAuthClientProvider = class {
     debugLog("Reading OAuth tokens");
     debugLog("Token request stack trace:", new Error().stack);
     let tokens = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
-    if (tokens?.refresh_token && this.refreshLockGeneration === null && !await this.tokensAreFresh(tokens)) {
-      debugLog("Access token stale \u2014 acquiring refresh lock");
-      if (await acquireRefreshLock(this.serverUrlHash)) {
-        const reread = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
-        if (reread && await this.tokensAreFresh(reread)) {
-          debugLog("Sibling process refreshed while we waited \u2014 using fresh tokens from disk");
-          await releaseRefreshLock(this.serverUrlHash);
-          return reread;
-        }
-        const generation = ++this.lockGenerationCounter;
-        this.refreshLockGeneration = generation;
-        setTimeout(() => {
-          if (this.refreshLockGeneration === generation) {
-            debugLog("Refresh lock failsafe fired \u2014 releasing (no saveTokens observed)");
-            this.refreshLockGeneration = null;
-            releaseRefreshLock(this.serverUrlHash).catch(() => {
-            });
-          }
-        }, REFRESH_LOCK_FAILSAFE_MS).unref?.();
-        tokens = reread ?? tokens;
-      } else {
-        debugLog("Refresh lock acquisition timed out \u2014 proceeding without coordination");
-      }
+    if (tokens?.refresh_token && !await this.tokensAreFresh(tokens)) {
+      debugLog("Access token stale \u2014 coordinated refresh");
+      tokens = await this.coordinatedRefresh(tokens);
     }
     if (tokens) {
       const timeLeft = tokens.expires_in || 0;
@@ -67179,6 +67157,64 @@ var NodeOAuthClientProvider = class {
     }
     return tokens;
   }
+  // In-process single-flight: concurrent tokens() callers share ONE refresh
+  // instead of each racing the rotating refresh_token (fixes re-entrancy leak).
+  async coordinatedRefresh(stale) {
+    if (this.inFlightRefresh) {
+      debugLog("Joining in-flight refresh");
+      return this.inFlightRefresh;
+    }
+    const p = this.doCoordinatedRefresh(stale).finally(() => {
+      this.inFlightRefresh = null;
+    });
+    this.inFlightRefresh = p;
+    return p;
+  }
+  async doCoordinatedRefresh(stale) {
+    if (!await acquireRefreshLock(this.serverUrlHash)) {
+      debugLog("Refresh lock timeout \u2014 re-reading disk for freshest tokens");
+      const reread = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
+      return reread ?? stale;
+    }
+    try {
+      const reread = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
+      if (reread && await this.tokensAreFresh(reread)) {
+        debugLog("Sibling refreshed while we waited \u2014 using fresh disk tokens");
+        return reread;
+      }
+      const current = reread ?? stale;
+      const asMeta = await this.getAuthorizationServerMetadata();
+      const clientInfo = await this.clientInformation();
+      if (!asMeta?.token_endpoint || !clientInfo || !current.refresh_token) {
+        debugLog("Cannot refresh in-provider (missing metadata/client/RT) \u2014 returning current tokens");
+        return current;
+      }
+      const resource = await selectResourceURL(
+        this.options.serverUrl,
+        this,
+        this.protectedResourceMetadata
+      );
+      try {
+        const fresh = await refreshAuthorization(asMeta.issuer, {
+          metadata: asMeta,
+          clientInformation: clientInfo,
+          refreshToken: current.refresh_token,
+          resource
+        });
+        await this.saveTokens(fresh);
+        debugLog("Provider-side refresh succeeded");
+        return fresh;
+      } catch (err) {
+        if (err instanceof InvalidGrantError) {
+          debugLog("Refresh token dead (invalid_grant) \u2014 browser re-auth required");
+          return current;
+        }
+        throw err;
+      }
+    } finally {
+      await releaseRefreshLock(this.serverUrlHash);
+    }
+  }
   /**
    * Saves OAuth tokens
    * @param tokens The tokens to save
@@ -67200,11 +67236,6 @@ var NodeOAuthClientProvider = class {
     });
     await writeJsonFile(this.serverUrlHash, "tokens.json", tokens);
     await writeJsonFile(this.serverUrlHash, "tokens-meta.json", { savedAt: Date.now() });
-    if (this.refreshLockGeneration !== null) {
-      this.refreshLockGeneration = null;
-      await releaseRefreshLock(this.serverUrlHash);
-      debugLog("Refresh complete \u2014 lock released");
-    }
   }
   // True when the stored access token is still valid (with skew), judged by
   // the sidecar's absolute savedAt + expires_in. Missing sidecar (pre-upgrade

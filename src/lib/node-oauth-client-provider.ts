@@ -1,10 +1,15 @@
 import open from 'open'
-import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import { OAuthClientProvider, refreshAuthorization, selectResourceURL } from '@modelcontextprotocol/sdk/client/auth.js'
+import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import {
   OAuthClientInformationFull,
   OAuthClientInformationFullSchema,
   OAuthTokens,
   OAuthTokensSchema,
+} from '@modelcontextprotocol/sdk/shared/auth.js'
+import type {
+  AuthorizationServerMetadata as SdkAuthorizationServerMetadata,
+  OAuthProtectedResourceMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
@@ -31,7 +36,6 @@ import { getConfigFilePath } from './mcp-auth-config'
 const REFRESH_SKEW_MS = 30_000 // treat tokens expiring within 30s as stale
 const REFRESH_LOCK_TIMEOUT_MS = 15_000 // max wait to acquire the lock
 const REFRESH_LOCK_STALE_MS = 60_000 // break locks older than this (crashed holder)
-const REFRESH_LOCK_FAILSAFE_MS = 20_000 // release own lock if refresh never saves
 
 type TokensMeta = { savedAt: number }
 
@@ -73,8 +77,7 @@ async function releaseRefreshLock(serverUrlHash: string): Promise<void> {
  */
 export class NodeOAuthClientProvider implements OAuthClientProvider {
   private serverUrlHash: string
-  private refreshLockGeneration: number | null = null
-  private lockGenerationCounter = 0
+  private inFlightRefresh: Promise<OAuthTokens | undefined> | null = null
   private callbackPath: string
   private clientName: string
   private clientUri: string
@@ -249,39 +252,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     let tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
 
-    // Refresh coordination: if the access token is stale and refreshable,
-    // serialize with sibling processes before letting the SDK refresh.
-    // Re-entrancy: if THIS process already holds the lock (SDK called
-    // tokens() again mid-refresh-cycle), don't contend with ourselves.
-    if (tokens?.refresh_token && this.refreshLockGeneration === null && !(await this.tokensAreFresh(tokens))) {
-      debugLog('Access token stale — acquiring refresh lock')
-      if (await acquireRefreshLock(this.serverUrlHash)) {
-        // Re-read: a sibling may have refreshed while we waited on the lock.
-        const reread = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
-        if (reread && (await this.tokensAreFresh(reread))) {
-          debugLog('Sibling process refreshed while we waited — using fresh tokens from disk')
-          await releaseRefreshLock(this.serverUrlHash)
-          return reread
-        }
-        // We hold the lock and tokens are genuinely stale: this process will
-        // perform the refresh. saveTokens() releases the lock. A failsafe
-        // releases it if the refresh dies before saving — generation-tagged
-        // so an old timer can never release a NEWER cycle's lock, and short
-        // (well under token lifetime) so a no-refresh path doesn't hold the
-        // fleet's lock long.
-        const generation = ++this.lockGenerationCounter
-        this.refreshLockGeneration = generation
-        setTimeout(() => {
-          if (this.refreshLockGeneration === generation) {
-            debugLog('Refresh lock failsafe fired — releasing (no saveTokens observed)')
-            this.refreshLockGeneration = null
-            releaseRefreshLock(this.serverUrlHash).catch(() => {})
-          }
-        }, REFRESH_LOCK_FAILSAFE_MS).unref?.()
-        tokens = reread ?? tokens
-      } else {
-        debugLog('Refresh lock acquisition timed out — proceeding without coordination')
-      }
+    if (tokens?.refresh_token && !(await this.tokensAreFresh(tokens))) {
+      debugLog('Access token stale — coordinated refresh')
+      tokens = await this.coordinatedRefresh(tokens)
     }
 
     if (tokens) {
@@ -311,6 +284,72 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     return tokens
   }
 
+  // In-process single-flight: concurrent tokens() callers share ONE refresh
+  // instead of each racing the rotating refresh_token (fixes re-entrancy leak).
+  private async coordinatedRefresh(stale: OAuthTokens): Promise<OAuthTokens | undefined> {
+    if (this.inFlightRefresh) {
+      debugLog('Joining in-flight refresh')
+      return this.inFlightRefresh
+    }
+    const p = this.doCoordinatedRefresh(stale).finally(() => {
+      this.inFlightRefresh = null
+    })
+    this.inFlightRefresh = p
+    return p
+  }
+
+  private async doCoordinatedRefresh(stale: OAuthTokens): Promise<OAuthTokens | undefined> {
+    if (!(await acquireRefreshLock(this.serverUrlHash))) {
+      // Lock timeout: NEVER hand onward a known-stale rotated RT. Re-read disk —
+      // a sibling almost certainly refreshed — and use the freshest tokens.
+      debugLog('Refresh lock timeout — re-reading disk for freshest tokens')
+      const reread = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+      return reread ?? stale
+    }
+    try {
+      // A sibling may have refreshed while we waited on the lock.
+      const reread = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+      if (reread && (await this.tokensAreFresh(reread))) {
+        debugLog('Sibling refreshed while we waited — using fresh disk tokens')
+        return reread
+      }
+      const current = reread ?? stale
+      const asMeta = await this.getAuthorizationServerMetadata()
+      const clientInfo = await this.clientInformation()
+      if (!asMeta?.token_endpoint || !clientInfo || !current.refresh_token) {
+        debugLog('Cannot refresh in-provider (missing metadata/client/RT) — returning current tokens')
+        return current
+      }
+      const resource = await selectResourceURL(
+        this.options.serverUrl,
+        this,
+        this.protectedResourceMetadata as unknown as OAuthProtectedResourceMetadata | undefined,
+      )
+      try {
+        const fresh = await refreshAuthorization(asMeta.issuer, {
+          metadata: asMeta as unknown as SdkAuthorizationServerMetadata,
+          clientInformation: clientInfo,
+          refreshToken: current.refresh_token,
+          resource,
+        })
+        await this.saveTokens(fresh) // writes tokens.json + tokens-meta.json sidecar
+        debugLog('Provider-side refresh succeeded')
+        return fresh
+      } catch (err) {
+        if (err instanceof InvalidGrantError) {
+          // RT genuinely dead — let the SDK's 401 → auth() path drive the (rare,
+          // correct) browser re-authorization.
+          debugLog('Refresh token dead (invalid_grant) — browser re-auth required')
+          return current
+        }
+        // Transient (network / ServerError): surface it, do NOT browser-bounce.
+        throw err
+      }
+    } finally {
+      await releaseRefreshLock(this.serverUrlHash)
+    }
+  }
+
   /**
    * Saves OAuth tokens
    * @param tokens The tokens to save
@@ -337,13 +376,6 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
     // Absolute-expiry sidecar (tokens.json only has a relative expires_in).
     await writeJsonFile(this.serverUrlHash, 'tokens-meta.json', { savedAt: Date.now() } satisfies TokensMeta)
-
-    // If this process held the refresh lock, the refresh is complete.
-    if (this.refreshLockGeneration !== null) {
-      this.refreshLockGeneration = null
-      await releaseRefreshLock(this.serverUrlHash)
-      debugLog('Refresh complete — lock released')
-    }
   }
 
   // True when the stored access token is still valid (with skew), judged by
