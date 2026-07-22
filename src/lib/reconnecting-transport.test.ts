@@ -136,4 +136,37 @@ describe('ReconnectingServerTransport', () => {
     await vi.runAllTimersAsync()
     expect(wrapper.isConnected()).toBe(true)
   })
+
+  it('close() during an in-flight connect(): the late-resolving transport is closed, not adopted', async () => {
+    const inner = makeTransport()
+    const next = makeTransport()
+    let resolveConnect: (t: Transport) => void
+    const connect = vi.fn().mockImplementation(
+      () =>
+        new Promise<Transport>((resolve) => {
+          resolveConnect = resolve
+        }),
+    )
+    const onReconnected = vi.fn()
+    const onclose = vi.fn()
+    const wrapper = new ReconnectingServerTransport(inner, { connect, onReconnected })
+    wrapper.onclose = onclose
+
+    inner.onclose?.()
+    await vi.advanceTimersByTimeAsync(1000) // clear the jittered backoff delay so connect() is invoked
+    expect(connect).toHaveBeenCalledTimes(1)
+    expect(wrapper.isConnected()).toBe(false)
+
+    // Permanent close happens while connect() is still pending.
+    await wrapper.close()
+    expect(onclose).toHaveBeenCalledTimes(1)
+
+    // The in-flight connect() now resolves — must not resurrect the wrapper.
+    resolveConnect!(next)
+    await vi.runAllTimersAsync()
+
+    expect(next.close).toHaveBeenCalled()
+    expect(onReconnected).not.toHaveBeenCalled()
+    expect(wrapper.isConnected()).toBe(false)
+  })
 })

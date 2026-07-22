@@ -97,8 +97,26 @@ export class ReconnectingServerTransport implements Transport {
       attempt++
       try {
         const next = await this.opts.connect()
+
+        // close() may have been called while connect() was in flight — don't
+        // resurrect a transport after the local server already saw onclose.
+        if (this.closed) {
+          try {
+            await next.close()
+          } catch {
+            /* ignore */
+          }
+          return
+        }
+
+        const old = this.current
+        // Unwire the outgoing transport first: an async late onclose/onerror
+        // from it must not fire scheduleReconnect against the healthy new one.
+        old.onmessage = undefined
+        old.onerror = undefined
+        old.onclose = undefined
         try {
-          await this.current.close()
+          await old.close()
         } catch {
           /* ignore */
         }

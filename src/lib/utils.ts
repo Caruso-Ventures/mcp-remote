@@ -353,8 +353,14 @@ export function mcpProxy({
     // Surface-watch poll responses are proxy-internal: observe and swallow.
     const raw = _message as any
     if (typeof raw.id === 'string' && raw.id.startsWith(SURFACE_POLL_ID_PREFIX)) {
-      if (raw.result?.tools) observeSurface(raw.result.tools)
-      else debugLog('[surface-watch] poll returned no tools', { error: raw.error })
+      if (raw.result?.tools) {
+        observeSurface(raw.result.tools)
+        // Keep the degrade cache current with the latest surface seen, not
+        // just the last organic client tools/list (same filtered shape).
+        lastToolsResult = { tools: raw.result.tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)) }
+      } else {
+        debugLog('[surface-watch] poll returned no tools', { error: raw.error })
+      }
       return
     }
 

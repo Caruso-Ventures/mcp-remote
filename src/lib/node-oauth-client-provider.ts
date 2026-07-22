@@ -342,15 +342,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         this,
         this.protectedResourceMetadata as unknown as OAuthProtectedResourceMetadata | undefined,
       )
+      let timeoutId: ReturnType<typeof setTimeout> | undefined
       try {
         // Bound the refresh POST: a hung request would otherwise hold the
         // cross-process lock (and inFlightRefresh) indefinitely. A timeout
         // is a TRANSIENT failure — same path as a network error below — not
         // an invalid_grant, so it must never invalidate tokens or open a
         // browser.
-        const timeout = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Refresh request timed out after ${REFRESH_HTTP_TIMEOUT_MS}ms`)), REFRESH_HTTP_TIMEOUT_MS),
-        )
+        const timeout = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`Refresh request timed out after ${REFRESH_HTTP_TIMEOUT_MS}ms`)),
+            REFRESH_HTTP_TIMEOUT_MS,
+          )
+        })
         const fresh = await Promise.race([
           refreshAuthorization(asMeta.issuer, {
             metadata: asMeta as unknown as SdkAuthorizationServerMetadata,
@@ -372,6 +376,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         }
         // Transient (network / ServerError): surface it, do NOT browser-bounce.
         throw err
+      } finally {
+        // Whichever side of the race wins, the other must not dangle and
+        // keep the event loop alive (delaying clean process exit).
+        clearTimeout(timeoutId)
       }
     } finally {
       await releaseRefreshLock(this.serverUrlHash)
