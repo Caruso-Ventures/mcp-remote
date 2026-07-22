@@ -30,7 +30,8 @@
     "lint-fix": "prettier --check . --write",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
-    "build:bridge": "esbuild src/proxy.ts --bundle --platform=node --format=esm --outfile=dist/cv-bridge.mjs --banner:js='import { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);'"
+    "build:bridge": "esbuild src/proxy.ts --bundle --platform=node --format=esm --outfile=dist/cv-bridge.mjs --banner:js='import { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);'",
+    "build:binary": "bun build ./src/bin-compiled.ts --compile --target=bun-darwin-arm64 --outfile dist/cv-bridge-arm64 && bun build ./src/bin-compiled.ts --compile --target=bun-darwin-x64 --outfile dist/cv-bridge-x64"
   },
   "dependencies": {
     "express": "^4.21.2",

@@ -1,0 +1,183 @@
+import { EventEmitter } from 'events'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import {
+  connectToRemoteServer,
+  log,
+  debugLog,
+  mcpProxy,
+  setupSignalHandlers,
+  TransportStrategy,
+  discoverOAuthServerInfo,
+} from './lib/utils'
+import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
+import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
+import { createLazyAuthCoordinator } from './lib/coordination'
+import { ReconnectingServerTransport } from './lib/reconnecting-transport'
+
+/**
+ * Main function to run the proxy
+ *
+ * Side-effect-free module: no top-level invocation here. The node CLI entry
+ * (src/proxy.ts) and the compiled-binary entry (src/bin-compiled.ts) both
+ * reach this via src/bin.ts's runFromArgv(), never by importing this module
+ * for its side effects.
+ */
+export async function runProxy(
+  serverUrl: string,
+  callbackPort: number,
+  headers: Record<string, string>,
+  transportStrategy: TransportStrategy = 'http-first',
+  host: string,
+  staticOAuthClientMetadata: StaticOAuthClientMetadata,
+  staticOAuthClientInfo: StaticOAuthClientInformationFull,
+  authorizeResource: string,
+  ignoredTools: string[],
+  authTimeoutMs: number,
+  serverUrlHash: string,
+  watchToolsMs?: number,
+) {
+  // Set up event emitter for auth flow
+  const events = new EventEmitter()
+
+  // Create a lazy auth coordinator
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
+
+  // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
+  // This probes the MCP server for WWW-Authenticate header and fetches PRM
+  log('Discovering OAuth server configuration...')
+  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
+
+  if (discoveryResult.protectedResourceMetadata) {
+    log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
+    if (discoveryResult.protectedResourceMetadata.scopes_supported) {
+      debugLog('Protected Resource Metadata scopes', {
+        scopes_supported: discoveryResult.protectedResourceMetadata.scopes_supported,
+      })
+    }
+  } else {
+    debugLog('No Protected Resource Metadata found, using server URL as authorization server')
+  }
+
+  // Create the OAuth client provider with discovered server info
+  const authProvider = new NodeOAuthClientProvider({
+    serverUrl: discoveryResult.authorizationServerUrl,
+    callbackPort,
+    host,
+    clientName: 'MCP CLI Proxy',
+    staticOAuthClientMetadata,
+    staticOAuthClientInfo,
+    authorizeResource,
+    serverUrlHash,
+    authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
+    protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
+    wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
+  })
+
+  // Create the STDIO transport for local connections
+  const localTransport = new StdioServerTransport()
+
+  // Keep track of the server instance for cleanup
+  let server: any = null
+
+  // Define an auth initializer function
+  const authInitializer = async () => {
+    const authState = await authCoordinator.initializeAuth()
+
+    // Store server in outer scope for cleanup
+    server = authState.server
+
+    // If auth was completed by another instance, just log that we'll use the auth from disk
+    if (authState.skipBrowserAuth) {
+      log('Authentication was completed by another instance - will use tokens from disk')
+      // TODO: remove, the callback is happening before the tokens are exchanged
+      //  so we're slightly too early
+      await new Promise((res) => setTimeout(res, 1_000))
+    }
+
+    return {
+      waitForAuthCode: authState.waitForAuthCode,
+      skipBrowserAuth: authState.skipBrowserAuth,
+    }
+  }
+
+  try {
+    const connectOnce = (allowInteractiveAuth: boolean) =>
+      connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, new Set(), allowInteractiveAuth)
+
+    // Initial connect MAY open a browser (first-time auth for the user).
+    const initialTransport = await connectOnce(true)
+
+    // subscribeReconnect/reconnectHandler indirection avoids adding a public
+    // field to the wrapper class for the mcpProxy -> wrapper reconnect signal.
+    let reconnectHandler: (() => void) | undefined
+
+    // After the first success, all reconnects are background: NEVER open a browser.
+    const remoteTransport = new ReconnectingServerTransport(initialTransport, {
+      connect: () => connectOnce(false),
+      minDelayMs: 500,
+      maxDelayMs: 30_000,
+      onReconnected: () => reconnectHandler?.(),
+    })
+
+    // Belt-and-suspenders: block any interactive auth from here on.
+    authProvider.setBackgroundMode(true)
+
+    // Set up bidirectional proxy between local and remote transports
+    mcpProxy({
+      transportToClient: localTransport,
+      transportToServer: remoteTransport,
+      ignoredTools,
+      watchToolsMs,
+      isServerConnected: () => remoteTransport.isConnected(),
+      subscribeReconnect: (handler) => {
+        reconnectHandler = handler
+      },
+    })
+
+    // Start the local STDIO server
+    await localTransport.start()
+    log('Local STDIO server running')
+    log(`Proxy established successfully between local STDIO and remote ${initialTransport.constructor.name}`)
+    log('Press Ctrl+C to exit')
+
+    // Setup cleanup handler
+    const cleanup = async () => {
+      await remoteTransport.close()
+      await localTransport.close()
+      // Only close the server if it was initialized
+      if (server) {
+        server.close()
+      }
+    }
+    setupSignalHandlers(cleanup)
+  } catch (error) {
+    log('Fatal error:', error)
+    if (error instanceof Error && error.message.includes('self-signed certificate in certificate chain')) {
+      log(`You may be behind a VPN!
+
+If you are behind a VPN, you can try setting the NODE_EXTRA_CA_CERTS environment variable to point
+to the CA certificate file. If using claude_desktop_config.json, this might look like:
+
+{
+  "mcpServers": {
+    "\${mcpServerName}": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse"
+      ],
+      "env": {
+        "NODE_EXTRA_CA_CERTS": "\${your CA certificate file path}.pem"
+      }
+    }
+  }
+}
+        `)
+    }
+    // Only close the server if it was initialized
+    if (server) {
+      server.close()
+    }
+    process.exit(1)
+  }
+}
