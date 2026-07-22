@@ -506,7 +506,9 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
         return undefined
       })
-      vi.mocked(refreshAuthorization).mockRejectedValueOnce(new Error('network')).mockResolvedValueOnce(freshFromRefresh as any)
+      vi.mocked(refreshAuthorization)
+        .mockRejectedValueOnce(new Error('network'))
+        .mockResolvedValueOnce(freshFromRefresh as any)
 
       provider = new NodeOAuthClientProvider({
         ...defaultOptions,

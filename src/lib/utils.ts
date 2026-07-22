@@ -153,9 +153,7 @@ function canonicalJson(v: unknown): string {
 }
 
 export function surfaceHashOfTools(tools: Array<{ name: string; description?: string; inputSchema?: unknown }>): string {
-  const canon = tools
-    .map((t) => [t.name, t.description ?? '', canonicalJson(t.inputSchema ?? null)])
-    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+  const canon = tools.map((t) => [t.name, t.description ?? '', canonicalJson(t.inputSchema ?? null)]).sort((a, b) => (a[0] < b[0] ? -1 : 1))
   return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex')
 }
 
@@ -164,11 +162,15 @@ export function mcpProxy({
   transportToServer,
   ignoredTools = [],
   watchToolsMs,
+  isServerConnected,
+  subscribeReconnect,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
   watchToolsMs?: number
+  isServerConnected?: () => boolean
+  subscribeReconnect?: (handler: () => void) => void
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
@@ -177,6 +179,10 @@ export function mcpProxy({
   let lastSurfaceHash: string | null = null
   let pollCounter = 0
   let pollTimer: ReturnType<typeof setInterval> | null = null
+
+  // Last filtered tools/list result. Served to a client tools/list while the
+  // upstream is disconnected (B2 graceful degrade); never reset on reconnect.
+  let lastToolsResult: { tools: any[] } | null = null
 
   // tools/call requests in flight, id -> tool name. Lets upstream call
   // failures be reshaped into instructive isError results (which the model
@@ -197,9 +203,7 @@ export function mcpProxy({
     const hash = surfaceHashOfTools(visible as any)
     if (lastSurfaceHash !== null && hash !== lastSurfaceHash) {
       log('[surface-watch] tool surface changed, notifying client')
-      transportToClient
-        .send({ jsonrpc: '2.0' as const, method: 'notifications/tools/list_changed' })
-        .catch(onClientError)
+      transportToClient.send({ jsonrpc: '2.0' as const, method: 'notifications/tools/list_changed' }).catch(onClientError)
     }
     lastSurfaceHash = hash
   }
@@ -252,6 +256,7 @@ export function mcpProxy({
         // hash is computed inside observeSurface from the pre-filter list, so
         // pass the raw tools; it applies the same filter itself.
         if (watchToolsMs) observeSurface(res.result.tools)
+        lastToolsResult = filtered.result // { tools: [...] } — served while degraded
         return filtered
       }
       return res
@@ -265,6 +270,16 @@ export function mcpProxy({
     // If interceptor returns MESSAGE_BLOCKED, don't forward the message
     if (isMessageBlocked(message)) {
       return
+    }
+
+    // B2 graceful degrade: while the upstream is disconnected, answer
+    // tools/list from the last-known cache instead of forwarding to a dead
+    // transport (which would just synthesize an error via the send-failure
+    // path below).
+    if (message.method === 'tools/list' && message.id !== undefined && isServerConnected && !isServerConnected() && lastToolsResult) {
+      log('[degrade] upstream disconnected — answering tools/list from last-known cache')
+      transportToClient.send({ jsonrpc: '2.0' as const, id: message.id, result: lastToolsResult }).catch(onClientError)
+      return // do not forward to a dead upstream
     }
 
     log('[Local→Remote]', message.method || message.id)
@@ -299,7 +314,39 @@ export function mcpProxy({
       pendingToolCalls.set(message.id, message.params.name)
     }
 
-    transportToServer.send(message).catch(onServerError)
+    transportToServer.send(message).catch((err: Error) => {
+      onServerError(err)
+      // The one-shot POST failed (StreamableHTTP cannot replay it); unblock
+      // the client for this id so Claude Code never hangs.
+      if (message.id === undefined) return
+      const toolName = pendingToolCalls.get(message.id)
+      if (toolName) {
+        pendingToolCalls.delete(message.id)
+        transportToClient
+          .send({
+            jsonrpc: '2.0' as const,
+            id: message.id,
+            result: {
+              isError: true,
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Call to "${toolName}" failed: upstream connection was interrupted (reconnecting). Please retry.`,
+                },
+              ],
+            },
+          })
+          .catch(onClientError)
+      } else {
+        transportToClient
+          .send({
+            jsonrpc: '2.0' as const,
+            id: message.id,
+            error: { code: -32001, message: 'Upstream connection interrupted; reconnecting. Please retry.' },
+          })
+          .catch(onClientError)
+      }
+    })
   }
 
   transportToServer.onmessage = (_message) => {
@@ -401,6 +448,14 @@ export function mcpProxy({
 
   transportToClient.onerror = onClientError
   transportToServer.onerror = onServerError
+
+  subscribeReconnect?.(() => {
+    log('[reconnect] re-checking tool surface after reconnect')
+    // Catches tool changes that happened during the outage; observeSurface
+    // emits list_changed ONLY on a real diff — lastSurfaceHash is preserved
+    // across reconnect, so an unchanged surface stays silent.
+    pollNow()
+  })
 
   function onClientError(error: Error) {
     log('Error from local client:', error)
@@ -556,6 +611,7 @@ export async function connectToRemoteServer(
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
   recursionReasons: Set<string> = new Set(),
+  allowInteractiveAuth: boolean = true,
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
 
@@ -663,8 +719,15 @@ export async function connectToRemoteServer(
         authInitializer,
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
+        allowInteractiveAuth,
       )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
+      if (!allowInteractiveAuth) {
+        log(
+          '[reconnect] upstream requires re-auth but interactive auth is suppressed (background reconnect) — will retry, serving last-known tools',
+        )
+        throw error // fail fast; the wrapper keeps retrying, never hangs on waitForAuthCode
+      }
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
         errorCode: error instanceof OAuthError ? error.errorCode : undefined,
@@ -707,7 +770,16 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          allowInteractiveAuth,
+        )
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {

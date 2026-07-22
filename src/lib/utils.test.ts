@@ -1,8 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { parseCommandLineArgs, shouldIncludeTool, mcpProxy, setupOAuthCallbackServerWithLongPoll, getServerUrlHash } from './utils'
+import {
+  parseCommandLineArgs,
+  shouldIncludeTool,
+  mcpProxy,
+  setupOAuthCallbackServerWithLongPoll,
+  getServerUrlHash,
+  connectToRemoteServer,
+} from './utils'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { EventEmitter } from 'events'
 import express from 'express'
+
+vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', async (importOriginal) => {
+  const actual = await importOriginal<any>()
+  return {
+    ...actual,
+    StreamableHTTPClientTransport: vi.fn(),
+  }
+})
 
 // All sanitizeUrl tests have been moved to the strict-url-sanitise package
 
@@ -978,6 +995,289 @@ describe('Feature: MCP Proxy', () => {
         result: {},
       }),
     )
+  })
+
+  it('Scenario: Reconnect with unchanged tool surface emits no list_changed', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    let reconnectHandler: (() => void) | undefined
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      watchToolsMs: 5000,
+      isServerConnected: () => true,
+      subscribeReconnect: (h) => {
+        reconnectHandler = h
+      },
+    })
+
+    // Seed the surface-watch baseline via an organic tools/list round trip.
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'tools/list', id: 'seed', params: {} })
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 'seed', result: { tools: [{ name: 'ping' }] } })
+
+    vi.clearAllMocks()
+
+    // Simulate a reconnect: mcpProxy re-checks the surface via pollNow().
+    reconnectHandler?.()
+    expect(mockTransportToServer.send).toHaveBeenCalledTimes(1)
+    const pollMessage = (mockTransportToServer.send as any).mock.calls[0][0]
+    expect(pollMessage.id).toMatch(/^cvbridge-poll-/)
+
+    // Same tools as before the outage -> no list_changed.
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: pollMessage.id, result: { tools: [{ name: 'ping' }] } })
+
+    expect(mockTransportToClient.send).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'notifications/tools/list_changed' }))
+  })
+
+  it('Scenario: Reconnect with changed tool surface emits exactly one list_changed', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    let reconnectHandler: (() => void) | undefined
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      watchToolsMs: 5000,
+      isServerConnected: () => true,
+      subscribeReconnect: (h) => {
+        reconnectHandler = h
+      },
+    })
+
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'tools/list', id: 'seed', params: {} })
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 'seed', result: { tools: [{ name: 'ping' }] } })
+
+    vi.clearAllMocks()
+
+    reconnectHandler?.()
+    const pollMessage = (mockTransportToServer.send as any).mock.calls[0][0]
+
+    // Surface changed during the outage (e.g. a redeploy added a tool).
+    mockTransportToServer.onmessage!({
+      jsonrpc: '2.0',
+      id: pollMessage.id,
+      result: { tools: [{ name: 'ping' }, { name: 'pong' }] },
+    })
+
+    const listChangedCalls = (mockTransportToClient.send as any).mock.calls.filter(
+      ([msg]: [any]) => msg.method === 'notifications/tools/list_changed',
+    )
+    expect(listChangedCalls).toHaveLength(1)
+  })
+
+  it('Scenario: Degraded tools/list served from cache while upstream is disconnected', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    let connected = true
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+      isServerConnected: () => connected,
+    })
+
+    // A successful tools/list while connected seeds the cache.
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'tools/list', id: '1', params: {} })
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: '1', result: { tools: [{ name: 'ping' }] } })
+
+    vi.clearAllMocks()
+    connected = false
+
+    // A subsequent tools/list while degraded is answered from cache, not forwarded.
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'tools/list', id: '2', params: {} })
+
+    expect(mockTransportToServer.send).not.toHaveBeenCalled()
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: '2',
+        result: { tools: [{ name: 'ping' }] },
+      }),
+    )
+  })
+
+  it('Scenario: In-flight tools/call whose send rejects synthesizes an isError result for the client', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('upstream gone')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage!({
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      id: 'call-1',
+      params: { name: 'doThing', arguments: {} },
+    })
+
+    // Allow the rejected send()'s .catch() handler to run.
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: 'call-1',
+        result: expect.objectContaining({
+          isError: true,
+          content: [expect.objectContaining({ text: expect.stringContaining('Call to "doThing" failed') })],
+        }),
+      }),
+    )
+  })
+
+  it('Scenario: In-flight non-tool request whose send rejects synthesizes a JSON-RPC error for the client', async () => {
+    const mockTransportToClient = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    const mockTransportToServer = {
+      send: vi.fn().mockRejectedValue(new Error('upstream gone')),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'resources/list', id: 'req-1', params: {} })
+
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jsonrpc: '2.0',
+        id: 'req-1',
+        error: expect.objectContaining({ code: -32001 }),
+      }),
+    )
+  })
+})
+
+describe('connectToRemoteServer - allowInteractiveAuth gating', () => {
+  beforeEach(() => {
+    vi.mocked(StreamableHTTPClientTransport).mockReset()
+  })
+
+  // Trace (Addendum 2): a dead refresh token surfaces from the SDK's own
+  // auth() retry (client/auth.js) as provider.redirectToAuthorization()
+  // either succeeding (foreground) or throwing (background, backgroundMode
+  // guard) — which the transport turns into a plain UnauthorizedError (or
+  // rethrows the background exception) from start()/client.connect(). Both
+  // arrive at this existing branch; allowInteractiveAuth is the only new gate.
+  it('background (allowInteractiveAuth=false): UnauthorizedError rejects without invoking authInitializer', async () => {
+    vi.mocked(StreamableHTTPClientTransport).mockImplementation(
+      () =>
+        ({
+          start: vi.fn().mockRejectedValue(new UnauthorizedError()),
+        }) as any,
+    )
+    const authInitializer = vi.fn()
+
+    await expect(
+      connectToRemoteServer(null, 'https://example.com/mcp', {} as any, {}, authInitializer, 'http-only', new Set(), false),
+    ).rejects.toThrow(UnauthorizedError)
+
+    expect(authInitializer).not.toHaveBeenCalled()
+  })
+
+  it('foreground (allowInteractiveAuth=true, default): UnauthorizedError triggers authInitializer', async () => {
+    vi.mocked(StreamableHTTPClientTransport).mockImplementation(
+      () =>
+        ({
+          start: vi.fn().mockRejectedValue(new UnauthorizedError()),
+        }) as any,
+    )
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: vi.fn().mockRejectedValue(new Error('stop-test-short-circuit')),
+      skipBrowserAuth: false,
+    })
+
+    await expect(
+      connectToRemoteServer(null, 'https://example.com/mcp', {} as any, {}, authInitializer, 'http-only', new Set(), true),
+    ).rejects.toThrow('stop-test-short-circuit')
+
+    expect(authInitializer).toHaveBeenCalledTimes(1)
   })
 })
 

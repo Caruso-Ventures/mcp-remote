@@ -24,11 +24,12 @@ import {
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
+import { ReconnectingServerTransport } from './lib/reconnecting-transport'
 
 /**
  * Main function to run the proxy
  */
-async function runProxy(
+export async function runProxy(
   serverUrl: string,
   callbackPort: number,
   headers: Record<string, string>,
@@ -107,8 +108,26 @@ async function runProxy(
   }
 
   try {
-    // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const connectOnce = (allowInteractiveAuth: boolean) =>
+      connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, new Set(), allowInteractiveAuth)
+
+    // Initial connect MAY open a browser (first-time auth for the user).
+    const initialTransport = await connectOnce(true)
+
+    // subscribeReconnect/reconnectHandler indirection avoids adding a public
+    // field to the wrapper class for the mcpProxy -> wrapper reconnect signal.
+    let reconnectHandler: (() => void) | undefined
+
+    // After the first success, all reconnects are background: NEVER open a browser.
+    const remoteTransport = new ReconnectingServerTransport(initialTransport, {
+      connect: () => connectOnce(false),
+      minDelayMs: 500,
+      maxDelayMs: 30_000,
+      onReconnected: () => reconnectHandler?.(),
+    })
+
+    // Belt-and-suspenders: block any interactive auth from here on.
+    authProvider.setBackgroundMode(true)
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
@@ -116,12 +135,16 @@ async function runProxy(
       transportToServer: remoteTransport,
       ignoredTools,
       watchToolsMs,
+      isServerConnected: () => remoteTransport.isConnected(),
+      subscribeReconnect: (handler) => {
+        reconnectHandler = handler
+      },
     })
 
     // Start the local STDIO server
     await localTransport.start()
     log('Local STDIO server running')
-    log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
+    log(`Proxy established successfully between local STDIO and remote ${initialTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
 
     // Setup cleanup handler

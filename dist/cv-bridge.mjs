@@ -65714,13 +65714,16 @@ function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
-  watchToolsMs
+  watchToolsMs,
+  isServerConnected,
+  subscribeReconnect
 }) {
   let transportToClientClosed = false;
   let transportToServerClosed = false;
   let lastSurfaceHash = null;
   let pollCounter = 0;
   let pollTimer = null;
+  let lastToolsResult = null;
   const pendingToolCalls = /* @__PURE__ */ new Map();
   const pollNow = () => {
     if (!watchToolsMs) return;
@@ -65775,6 +65778,7 @@ function mcpProxy({
           }
         };
         if (watchToolsMs) observeSurface(res.result.tools);
+        lastToolsResult = filtered.result;
         return filtered;
       }
       return res;
@@ -65783,6 +65787,11 @@ function mcpProxy({
   transportToClient.onmessage = (_message) => {
     const message = messageTransformer.interceptRequest(_message);
     if (isMessageBlocked(message)) {
+      return;
+    }
+    if (message.method === "tools/list" && message.id !== void 0 && isServerConnected && !isServerConnected() && lastToolsResult) {
+      log("[degrade] upstream disconnected \u2014 answering tools/list from last-known cache");
+      transportToClient.send({ jsonrpc: "2.0", id: message.id, result: lastToolsResult }).catch(onClientError);
       return;
     }
     log("[Local\u2192Remote]", message.method || message.id);
@@ -65807,7 +65816,33 @@ function mcpProxy({
       }
       pendingToolCalls.set(message.id, message.params.name);
     }
-    transportToServer.send(message).catch(onServerError);
+    transportToServer.send(message).catch((err) => {
+      onServerError(err);
+      if (message.id === void 0) return;
+      const toolName = pendingToolCalls.get(message.id);
+      if (toolName) {
+        pendingToolCalls.delete(message.id);
+        transportToClient.send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Call to "${toolName}" failed: upstream connection was interrupted (reconnecting). Please retry.`
+              }
+            ]
+          }
+        }).catch(onClientError);
+      } else {
+        transportToClient.send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32001, message: "Upstream connection interrupted; reconnecting. Please retry." }
+        }).catch(onClientError);
+      }
+    });
   };
   transportToServer.onmessage = (_message) => {
     const raw = _message;
@@ -65885,6 +65920,10 @@ function mcpProxy({
   };
   transportToClient.onerror = onClientError;
   transportToServer.onerror = onServerError;
+  subscribeReconnect?.(() => {
+    log("[reconnect] re-checking tool surface after reconnect");
+    pollNow();
+  });
   function onClientError(error2) {
     log("Error from local client:", error2);
     debugLog("Error from local client", { stack: error2.stack });
@@ -65957,7 +65996,7 @@ async function discoverOAuthServerInfo2(serverUrl, headers = {}) {
     wwwAuthenticateScope
   };
 }
-async function connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy = "http-first", recursionReasons = /* @__PURE__ */ new Set()) {
+async function connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy = "http-first", recursionReasons = /* @__PURE__ */ new Set(), allowInteractiveAuth = true) {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`);
   headers = { "X-Bridge-Version": version2, ...headers };
   const url2 = new URL(serverUrl);
@@ -66024,9 +66063,16 @@ async function connectToRemoteServer(client, serverUrl, authProvider, headers, a
         headers,
         authInitializer,
         sseTransport ? "http-only" : "sse-only",
-        recursionReasons
+        recursionReasons,
+        allowInteractiveAuth
       );
     } else if (error2 instanceof UnauthorizedError || error2 instanceof Error && error2.message.includes("Unauthorized")) {
+      if (!allowInteractiveAuth) {
+        log(
+          "[reconnect] upstream requires re-auth but interactive auth is suppressed (background reconnect) \u2014 will retry, serving last-known tools"
+        );
+        throw error2;
+      }
       log("Authentication required. Initializing auth...");
       debugLog("Authentication error detected", {
         errorCode: error2 instanceof OAuthError ? error2.errorCode : void 0,
@@ -66058,7 +66104,16 @@ async function connectToRemoteServer(client, serverUrl, authProvider, headers, a
         recursionReasons.add(REASON_AUTH_NEEDED);
         log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`);
         debugLog("Recursively reconnecting after auth", { recursionReasons: Array.from(recursionReasons) });
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons);
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          allowInteractiveAuth
+        );
       } catch (authError) {
         log("Authorization error:", authError);
         debugLog("Authorization error during finishAuth", {
@@ -66950,6 +67005,7 @@ import { statSync } from "node:fs";
 var REFRESH_SKEW_MS = 3e4;
 var REFRESH_LOCK_TIMEOUT_MS = 15e3;
 var REFRESH_LOCK_STALE_MS = 6e4;
+var REFRESH_HTTP_TIMEOUT_MS = 25e3;
 function refreshLockPath(serverUrlHash) {
   return getConfigFilePath(serverUrlHash, "refresh.lock");
 }
@@ -67017,6 +67073,14 @@ var NodeOAuthClientProvider = class {
   authorizationServerMetadata;
   protectedResourceMetadata;
   wwwAuthenticateScope;
+  backgroundMode = false;
+  /**
+   * Belt-and-suspenders guard for background reconnects: once enabled,
+   * redirectToAuthorization() refuses to open a browser and throws instead.
+   */
+  setBackgroundMode(v) {
+    this.backgroundMode = v;
+  }
   get redirectUrl() {
     return `http://${this.options.host}:${this.options.callbackPort}${this.callbackPath}`;
   }
@@ -67129,7 +67193,7 @@ var NodeOAuthClientProvider = class {
    */
   async tokens() {
     debugLog("Reading OAuth tokens");
-    debugLog("Token request stack trace:", new Error().stack);
+    if (DEBUG) debugLog("Token request stack trace:", new Error().stack);
     let tokens = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
     if (tokens?.refresh_token && !await this.tokensAreFresh(tokens)) {
       debugLog("Access token stale \u2014 coordinated refresh");
@@ -67195,12 +67259,18 @@ var NodeOAuthClientProvider = class {
         this.protectedResourceMetadata
       );
       try {
-        const fresh = await refreshAuthorization(asMeta.issuer, {
-          metadata: asMeta,
-          clientInformation: clientInfo,
-          refreshToken: current.refresh_token,
-          resource
-        });
+        const timeout = new Promise(
+          (_, reject) => setTimeout(() => reject(new Error(`Refresh request timed out after ${REFRESH_HTTP_TIMEOUT_MS}ms`)), REFRESH_HTTP_TIMEOUT_MS)
+        );
+        const fresh = await Promise.race([
+          refreshAuthorization(asMeta.issuer, {
+            metadata: asMeta,
+            clientInformation: clientInfo,
+            refreshToken: current.refresh_token,
+            resource
+          }),
+          timeout
+        ]);
         await this.saveTokens(fresh);
         debugLog("Provider-side refresh succeeded");
         return fresh;
@@ -67253,6 +67323,12 @@ var NodeOAuthClientProvider = class {
    * @param authorizationUrl The URL to redirect to
    */
   async redirectToAuthorization(authorizationUrl) {
+    if (this.backgroundMode) {
+      log(
+        "[auth] background token refresh needs re-authorization, but interactive browser auth is suppressed. Serving last-known tools. To re-authenticate, restart the bridge or run the cv-mcp login command."
+      );
+      throw new Error("interactive-auth-suppressed");
+    }
     this.getAuthorizationServerMetadata().catch(() => {
     });
     if (this.authorizeResource) {
@@ -67513,6 +67589,94 @@ async function coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs
   };
 }
 
+// src/lib/reconnecting-transport.ts
+var ReconnectingServerTransport = class {
+  onmessage;
+  onclose;
+  onerror;
+  current;
+  opts;
+  reconnecting = false;
+  closed = false;
+  connected = true;
+  constructor(initial, opts) {
+    this.opts = { minDelayMs: 500, maxDelayMs: 3e4, ...opts };
+    this.current = initial;
+    this.wireInner(this.current);
+  }
+  isConnected() {
+    return this.connected && !this.closed;
+  }
+  async start() {
+  }
+  async send(message) {
+    if (this.closed) throw new Error("transport closed");
+    try {
+      await this.current.send(message);
+    } catch (err) {
+      debugLog("[reconnect] send failed, scheduling reconnect", { message: err.message });
+      this.scheduleReconnect();
+      throw err;
+    }
+  }
+  async close() {
+    this.closed = true;
+    try {
+      await this.current.close();
+    } catch {
+    }
+    this.onclose?.();
+  }
+  wireInner(t) {
+    t.onmessage = (m) => this.onmessage?.(m);
+    t.onerror = (e) => {
+      this.onerror?.(e);
+      this.scheduleReconnect();
+    };
+    t.onclose = () => {
+      if (!this.closed) this.scheduleReconnect();
+    };
+  }
+  setConnected(v) {
+    if (this.connected !== v) {
+      this.connected = v;
+      this.opts.onStateChange?.(v);
+    }
+  }
+  scheduleReconnect() {
+    if (this.reconnecting || this.closed) return;
+    this.reconnecting = true;
+    this.setConnected(false);
+    void this.reconnectLoop();
+  }
+  async reconnectLoop() {
+    let attempt = 0;
+    while (!this.closed) {
+      const cap = Math.min(this.opts.maxDelayMs, this.opts.minDelayMs * 2 ** attempt);
+      const delay = Math.floor(Math.random() * cap);
+      await new Promise((r) => setTimeout(r, delay));
+      if (this.closed) return;
+      attempt++;
+      try {
+        const next = await this.opts.connect();
+        try {
+          await this.current.close();
+        } catch {
+        }
+        this.current = next;
+        this.wireInner(next);
+        this.reconnecting = false;
+        this.setConnected(true);
+        log("[reconnect] upstream reconnected");
+        this.opts.onReconnected?.(next);
+        return;
+      } catch (e) {
+        debugLog("[reconnect] attempt failed", { attempt, message: e.message });
+      }
+    }
+  }
+};
+
 // src/proxy.ts
 async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "http-first", host, staticOAuthClientMetadata, staticOAuthClientInfo, authorizeResource, ignoredTools, authTimeoutMs, serverUrlHash, watchToolsMs) {
   const events = new EventEmitter();
@@ -67557,16 +67721,29 @@ async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "h
     };
   };
   try {
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy);
+    const connectOnce = (allowInteractiveAuth) => connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy, /* @__PURE__ */ new Set(), allowInteractiveAuth);
+    const initialTransport = await connectOnce(true);
+    let reconnectHandler;
+    const remoteTransport = new ReconnectingServerTransport(initialTransport, {
+      connect: () => connectOnce(false),
+      minDelayMs: 500,
+      maxDelayMs: 3e4,
+      onReconnected: () => reconnectHandler?.()
+    });
+    authProvider.setBackgroundMode(true);
     mcpProxy({
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
-      watchToolsMs
+      watchToolsMs,
+      isServerConnected: () => remoteTransport.isConnected(),
+      subscribeReconnect: (handler) => {
+        reconnectHandler = handler;
+      }
     });
     await localTransport.start();
     log("Local STDIO server running");
-    log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`);
+    log(`Proxy established successfully between local STDIO and remote ${initialTransport.constructor.name}`);
     log("Press Ctrl+C to exit");
     const cleanup = async () => {
       await remoteTransport.close();
@@ -67641,6 +67818,9 @@ parseCommandLineArgs(process.argv.slice(2), "Usage: npx tsx proxy.ts <https://se
   log("Fatal error:", error2);
   process.exit(1);
 });
+export {
+  runProxy
+};
 /*! Bundled license information:
 
 depd/index.js:
