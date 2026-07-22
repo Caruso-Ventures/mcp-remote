@@ -14,7 +14,7 @@ import type {
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
-import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
+import { log, debugLog, DEBUG, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
@@ -28,14 +28,22 @@ import { getConfigFilePath } from './mcp-auth-config'
 // tokens were saved; together they give absolute expiry. When the access
 // token is stale, concurrent proxies would otherwise all burn the same
 // (rotating) refresh_token — first wins, the rest get invalid_grant and drop
-// the user into a browser re-auth. A mkdir-based lock serializes refresh:
-// the lock is taken in tokens() when stale, held through the SDK's refresh,
-// and released in saveTokens(). Waiters re-read disk after acquiring — if a
-// sibling already refreshed, they return the fresh tokens and the SDK never
-// refreshes at all.
+// the user into a browser re-auth. A mkdir-based cross-process lock (below)
+// serializes refresh across sibling processes: acquired in tokens() when
+// stale, released in saveTokens()/doCoordinatedRefresh's finally. Within a
+// single process, coordinatedRefresh()/inFlightRefresh makes concurrent
+// tokens() callers share ONE in-flight refresh instead of each racing the
+// lock. Waiters (lock or in-flight) re-read disk after acquiring/joining —
+// if a sibling or a concurrent caller already refreshed, they return the
+// fresh tokens and the SDK never refreshes at all. saveTokens() is a pure
+// write (tokens.json + the savedAt sidecar); it does not touch the lock or
+// inFlightRefresh. The browser is opened only on a genuine InvalidGrantError
+// surfaced by the SDK's own auth() retry (see redirectToAuthorization) —
+// never from this coordination logic.
 const REFRESH_SKEW_MS = 30_000 // treat tokens expiring within 30s as stale
 const REFRESH_LOCK_TIMEOUT_MS = 15_000 // max wait to acquire the lock
 const REFRESH_LOCK_STALE_MS = 60_000 // break locks older than this (crashed holder)
+const REFRESH_HTTP_TIMEOUT_MS = 25_000 // treat a hung refresh POST as transient, not invalid_grant
 
 type TokensMeta = { savedAt: number }
 
@@ -91,6 +99,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
+  private backgroundMode = false
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -111,6 +120,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.authorizationServerMetadata = options.authorizationServerMetadata
     this.protectedResourceMetadata = options.protectedResourceMetadata
     this.wwwAuthenticateScope = options.wwwAuthenticateScope
+  }
+
+  /**
+   * Belt-and-suspenders guard for background reconnects: once enabled,
+   * redirectToAuthorization() refuses to open a browser and throws instead.
+   */
+  setBackgroundMode(v: boolean): void {
+    this.backgroundMode = v
   }
 
   get redirectUrl(): string {
@@ -248,7 +265,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    */
   async tokens(): Promise<OAuthTokens | undefined> {
     debugLog('Reading OAuth tokens')
-    debugLog('Token request stack trace:', new Error().stack)
+    if (DEBUG) debugLog('Token request stack trace:', new Error().stack)
 
     let tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
 
@@ -326,12 +343,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         this.protectedResourceMetadata as unknown as OAuthProtectedResourceMetadata | undefined,
       )
       try {
-        const fresh = await refreshAuthorization(asMeta.issuer, {
-          metadata: asMeta as unknown as SdkAuthorizationServerMetadata,
-          clientInformation: clientInfo,
-          refreshToken: current.refresh_token,
-          resource,
-        })
+        // Bound the refresh POST: a hung request would otherwise hold the
+        // cross-process lock (and inFlightRefresh) indefinitely. A timeout
+        // is a TRANSIENT failure — same path as a network error below — not
+        // an invalid_grant, so it must never invalidate tokens or open a
+        // browser.
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Refresh request timed out after ${REFRESH_HTTP_TIMEOUT_MS}ms`)), REFRESH_HTTP_TIMEOUT_MS),
+        )
+        const fresh = await Promise.race([
+          refreshAuthorization(asMeta.issuer, {
+            metadata: asMeta as unknown as SdkAuthorizationServerMetadata,
+            clientInformation: clientInfo,
+            refreshToken: current.refresh_token,
+            resource,
+          }),
+          timeout,
+        ])
         await this.saveTokens(fresh) // writes tokens.json + tokens-meta.json sidecar
         debugLog('Provider-side refresh succeeded')
         return fresh
@@ -395,6 +423,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @param authorizationUrl The URL to redirect to
    */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    if (this.backgroundMode) {
+      log(
+        '[auth] background token refresh needs re-authorization, but interactive browser auth is suppressed. ' +
+          'Serving last-known tools. To re-authenticate, restart the bridge or run the cv-mcp login command.',
+      )
+      throw new Error('interactive-auth-suppressed') // reject the auth flow instead of opening a browser
+    }
+
     // Optionally fetch metadata for debugging/informational purposes (non-blocking)
     this.getAuthorizationServerMetadata().catch(() => {
       // Ignore errors, metadata is optional

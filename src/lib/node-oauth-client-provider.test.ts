@@ -123,6 +123,28 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
   })
 
+  describe('background mode', () => {
+    it('setBackgroundMode(true) suppresses the browser and throws instead of opening it', async () => {
+      const open = (await import('open')).default
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      provider.setBackgroundMode(true)
+
+      const authUrl = new URL('https://auth.example.com/authorize')
+      await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow('interactive-auth-suppressed')
+      expect(open).not.toHaveBeenCalled()
+    })
+
+    it('setBackgroundMode(false) (default) opens the browser as before', async () => {
+      const open = (await import('open')).default
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const authUrl = new URL('https://auth.example.com/authorize')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(open).toHaveBeenCalled()
+    })
+  })
+
   describe('backward compatibility', () => {
     it('should preserve existing custom scope behavior', () => {
       provider = new NodeOAuthClientProvider({
@@ -445,6 +467,57 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       })
 
       await expect(provider.tokens()).rejects.toThrow('network')
+    })
+
+    it('lock-acquired: sibling refreshed while we waited — uses fresh disk tokens, no second refresh', async () => {
+      const freshSibling = { access_token: 'sibling2', refresh_token: 'rt3', expires_in: 300, token_type: 'Bearer' }
+      let tokensCall = 0
+      let metaCall = 0
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') {
+          tokensCall += 1
+          return tokensCall === 1 ? staleTokens : freshSibling
+        }
+        if (filename === 'tokens-meta.json') {
+          metaCall += 1
+          // First check (pre-lock, on the original stale tokens): stale.
+          // Second check (post-lock reread, on the sibling's tokens): fresh.
+          return metaCall === 1 ? { savedAt: 0 } : { savedAt: Date.now() }
+        }
+        if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
+        return undefined
+      })
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+      })
+
+      const result = await provider.tokens()
+
+      expect(result).toMatchObject(freshSibling)
+      expect(refreshAuthorization).not.toHaveBeenCalled()
+    })
+
+    it('transient refresh failure clears inFlightRefresh — a subsequent tokens() call retries the refresh', async () => {
+      mockReadJsonFile.mockImplementation(async (_hash: string, filename: string) => {
+        if (filename === 'tokens.json') return staleTokens
+        if (filename === 'tokens-meta.json') return { savedAt: 0 }
+        if (filename === 'client_info.json') return { client_id: 'test-client', redirect_uris: [] }
+        return undefined
+      })
+      vi.mocked(refreshAuthorization).mockRejectedValueOnce(new Error('network')).mockResolvedValueOnce(freshFromRefresh as any)
+
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: { issuer: 'https://auth.example.com', token_endpoint: 'https://auth.example.com/token' },
+      })
+
+      await expect(provider.tokens()).rejects.toThrow('network')
+      const second = await provider.tokens()
+
+      expect(second).toMatchObject(freshFromRefresh)
+      expect(refreshAuthorization).toHaveBeenCalledTimes(2)
     })
 
     it('fresh token short-circuits: no refresh, no lock', async () => {
