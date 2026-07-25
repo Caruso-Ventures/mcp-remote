@@ -9,10 +9,16 @@
 // appears. Asserts the session can call beta afterward. No model self-report
 // is trusted beyond the final marker line.
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+// launchd runs with a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin), so the CLI has
+// to be resolved explicitly or every scheduled run dies on spawnSync ENOENT.
+const claudeBin = process.env.CLAUDE_BIN
+  ?? [`${process.env.HOME}/.local/bin/claude`, '/opt/homebrew/bin/claude'].find(p => existsSync(p))
+  ?? 'claude'
 
 const dir = mkdtempSync(join(tmpdir(), 'cv-refresh-canary-'))
 const trigger = join(dir, 'trigger')
@@ -40,14 +46,14 @@ const prompt = [
 ].join(' ')
 
 try {
-  const out = execFileSync('claude', [
+  const out = execFileSync(claudeBin, [
     '-p', '--mcp-config', mcpConfig, '--strict-mcp-config',
     '--allowedTools', 'mcp__refresh-canary__alpha,mcp__refresh-canary__beta,Bash(touch:*),Bash(sleep:*)',
     '--model', 'claude-haiku-4-5-20251001',
     prompt,
   ], { encoding: 'utf8', timeout: 240_000, stdio: ['ignore', 'pipe', 'pipe'] })
 
-  const version = spawnSync('claude', ['--version'], { encoding: 'utf8' }).stdout?.trim() ?? 'unknown'
+  const version = spawnSync(claudeBin, ['--version'], { encoding: 'utf8' }).stdout?.trim() ?? 'unknown'
   if (/VERDICT: BETA_WORKED/.test(out)) {
     console.log(`OK — mid-session list_changed refresh works (${version})`)
     process.exit(0)
